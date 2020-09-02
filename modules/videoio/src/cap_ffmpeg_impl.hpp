@@ -534,7 +534,6 @@ struct CvCapture_FFMPEG
 
     bool use_hw_codec;
     AVBufferRef *hw_device_ref;
-    AVCodecContext *decoder_ctx;
 };
 
 void CvCapture_FFMPEG::init()
@@ -573,7 +572,6 @@ void CvCapture_FFMPEG::init()
 
     use_hw_codec = 0;
     hw_device_ref = NULL;
-    decoder_ctx = NULL;
 }
 
 
@@ -645,7 +643,6 @@ void CvCapture_FFMPEG::close()
     }
 
     if (use_hw_codec) {
-       avcodec_free_context(&decoder_ctx);
        av_buffer_unref(&hw_device_ref);
     }
 
@@ -978,6 +975,7 @@ bool CvCapture_FFMPEG::try_hw_codec(AVCodecContext *enc, AVStream *video_st)
 {
    int ret;
    AVCodec *codec;
+   AVCodecContext org_enc = *enc;
 
    // check environment variable
    char* dfh_env = getenv("OPENCV_FFMPEG_CAPTURE_DISABLE_HW");
@@ -1003,40 +1001,34 @@ bool CvCapture_FFMPEG::try_hw_codec(AVCodecContext *enc, AVStream *video_st)
       goto hw_invalid;
    }
 
-   decoder_ctx = avcodec_alloc_context3(codec);
-   if (!decoder_ctx) {
-      CV_WARN("Not enough memory");
-      goto hw_invalid;
-   }
-
-   decoder_ctx->codec_id = AV_CODEC_ID_H264;
    if (video_st->codecpar->extradata_size) {
-      decoder_ctx->extradata =  (uint8_t *)av_mallocz(video_st->codecpar->extradata_size +
+      enc->extradata =  (uint8_t *)av_mallocz(video_st->codecpar->extradata_size +
             AV_INPUT_BUFFER_PADDING_SIZE);
-      if (!decoder_ctx->extradata) {
+      if (!enc->extradata) {
          CV_WARN("Not enough memory");
          goto hw_invalid;
       }
       else
       {
-         memcpy(decoder_ctx->extradata, video_st->codecpar->extradata,
+         memcpy(enc->extradata, video_st->codecpar->extradata,
                video_st->codecpar->extradata_size);
-         decoder_ctx->extradata_size = video_st->codecpar->extradata_size;
+         enc->extradata_size = video_st->codecpar->extradata_size;
       }
    }
 
-   decoder_ctx->opaque      = hw_device_ref;
-   decoder_ctx->get_format  = get_format;
+   enc->opaque      = hw_device_ref;
+   enc->get_format  = get_format;
 
-   if (avcodec_open2(decoder_ctx, codec, NULL) < 0)
+   if (avcodec_open2(enc, codec, NULL) < 0)
       goto hw_invalid;
 
    return true;
 
 hw_invalid:
-   // release hw stuff
-   avcodec_free_context(&decoder_ctx);
    av_buffer_unref(&hw_device_ref);
+   if (enc->extradata)
+      av_free(enc->extradata);
+   *enc = org_enc;
 
    return false;
 }
@@ -1371,7 +1363,7 @@ bool CvCapture_FFMPEG::grabFrame()
 
         // Decode video frame
         if (use_hw_codec) {
-           hw_decode_packet(decoder_ctx, picture, &got_picture, &packet);
+           hw_decode_packet(video_st->codec, picture, &got_picture, &packet);
         } else {
            avcodec_decode_video2(video_st->codec, picture, &got_picture, &packet);
         }
@@ -1678,10 +1670,7 @@ void CvCapture_FFMPEG::seek(int64_t _frame_number)
         double  time_base  = r2d(ic->streams[video_stream]->time_base);
         time_stamp += (int64_t)(sec / time_base + 0.5);
         if (get_total_frames() > 1) av_seek_frame(ic, video_stream, time_stamp, AVSEEK_FLAG_BACKWARD);
-        if (use_hw_codec)
-           avcodec_flush_buffers(decoder_ctx);
-        else
-           avcodec_flush_buffers(ic->streams[video_stream]->codec);
+        avcodec_flush_buffers(ic->streams[video_stream]->codec);
         if( _frame_number > 0 )
         {
             grabFrame();
