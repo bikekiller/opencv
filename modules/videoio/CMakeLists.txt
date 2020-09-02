@@ -195,6 +195,7 @@ endif()
 
 ocv_set_module_sources(HEADERS ${videoio_ext_hdrs} ${videoio_hdrs} SOURCES ${videoio_srcs})
 ocv_module_include_directories()
+include_directories(/opt/intel/mediasdk/include)
 ocv_create_module()
 ocv_add_accuracy_tests(${tgts})
 ocv_add_perf_tests(${tgts})

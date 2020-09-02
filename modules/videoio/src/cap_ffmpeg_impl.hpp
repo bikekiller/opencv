@@ -86,6 +86,14 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 
+#include <libavutil/buffer.h>
+#include <libavutil/error.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_qsv.h>
+#include <libavutil/mem.h>
+
+#include <libavformat/avio.h>
+
 #ifdef __cplusplus
 }
 #endif
@@ -480,6 +488,7 @@ struct CvCapture_FFMPEG
     int64_t dts_to_frame_number(int64_t dts);
     double  dts_to_sec(int64_t dts) const;
     void    get_rotation_angle();
+    bool    try_hw_codec(AVCodecContext *enc, AVStream *video_st);
 
     AVFormatContext * ic;
     AVCodec         * avcodec;
@@ -522,6 +531,10 @@ struct CvCapture_FFMPEG
  #else
     AVBitStreamFilterContext* bsfc;
 #endif
+
+    bool use_hw_codec;
+    AVBufferRef *hw_device_ref;
+    AVCodecContext *decoder_ctx;
 };
 
 void CvCapture_FFMPEG::init()
@@ -557,6 +570,10 @@ void CvCapture_FFMPEG::init()
     memset(&packet_filtered, 0, sizeof(packet_filtered));
     av_init_packet(&packet_filtered);
     bsfc = NULL;
+
+    use_hw_codec = 0;
+    hw_device_ref = NULL;
+    decoder_ctx = NULL;
 }
 
 
@@ -625,6 +642,11 @@ void CvCapture_FFMPEG::close()
 #else
         av_bitstream_filter_close(bsfc);
 #endif
+    }
+
+    if (use_hw_codec) {
+       avcodec_free_context(&decoder_ctx);
+       av_buffer_unref(&hw_device_ref);
     }
 
     init();
@@ -857,6 +879,168 @@ public:
     }
 };
 
+static AVPixelFormat get_format(AVCodecContext *avctx, const enum AVPixelFormat *pix_fmts)
+{
+    while (*pix_fmts != AV_PIX_FMT_NONE) {
+        if (*pix_fmts == AV_PIX_FMT_QSV) {
+            AVBufferRef *hw_device_ref = (AVBufferRef *) avctx->opaque;
+            AVHWFramesContext  *frames_ctx;
+            AVQSVFramesContext *frames_hwctx;
+            int ret;
+
+            /* create a pool of surfaces to be used by the decoder */
+            avctx->hw_frames_ctx = av_hwframe_ctx_alloc(hw_device_ref);
+            if (!avctx->hw_frames_ctx)
+                return AV_PIX_FMT_NONE;
+            frames_ctx   = (AVHWFramesContext*)avctx->hw_frames_ctx->data;
+            frames_hwctx = (AVQSVFramesContext *)frames_ctx->hwctx;
+
+            frames_ctx->format            = AV_PIX_FMT_QSV;
+            frames_ctx->sw_format         = avctx->sw_pix_fmt;
+            frames_ctx->width             = FFALIGN(avctx->coded_width,  32);
+            frames_ctx->height            = FFALIGN(avctx->coded_height, 32);
+            frames_ctx->initial_pool_size = 32;
+
+            frames_hwctx->frame_type = MFX_MEMTYPE_VIDEO_MEMORY_DECODER_TARGET;
+
+            ret = av_hwframe_ctx_init(avctx->hw_frames_ctx);
+            if (ret < 0)
+                return AV_PIX_FMT_NONE;
+
+            return AV_PIX_FMT_QSV;
+        }
+
+        pix_fmts++;
+    }
+
+    CV_WARN("The QSV pixel format not offered in get_format()");
+
+    return AV_PIX_FMT_NONE;
+}
+
+static int hw_decode_receive_frame(AVCodecContext *decoder_ctx, AVFrame *sw_frame)
+{
+    int ret = -1;
+
+    AVFrame *hw_frame = NULL;
+#if LIBAVCODEC_BUILD >= (LIBAVCODEC_VERSION_MICRO >= 100 \
+    ? CALC_FFMPEG_VERSION(55, 45, 101) : CALC_FFMPEG_VERSION(55, 28, 1))
+        hw_frame = av_frame_alloc();
+#else
+        hw_frame = avcodec_alloc_frame();
+#endif
+
+    ret = avcodec_receive_frame(decoder_ctx, hw_frame);
+    if ( ret == 0 ) //got the hw_frame
+    {
+        ret = av_hwframe_transfer_data(sw_frame, hw_frame, 0);
+        if (ret < 0){
+            CV_WARN("Error transferring the data to system memory");
+        } else {
+           sw_frame->pkt_pts = hw_frame->pkt_pts;
+           sw_frame->pkt_dts = hw_frame->pkt_dts;
+        }
+    }
+
+#if LIBAVCODEC_BUILD >= (LIBAVCODEC_VERSION_MICRO >= 100 \
+    ? CALC_FFMPEG_VERSION(55, 45, 101) : CALC_FFMPEG_VERSION(55, 28, 1))
+        av_frame_free(&hw_frame);
+#elif LIBAVCODEC_BUILD >= (LIBAVCODEC_VERSION_MICRO >= 100 \
+    ? CALC_FFMPEG_VERSION(54, 59, 100) : CALC_FFMPEG_VERSION(54, 28, 0))
+        avcodec_free_frame(&hw_frame);
+#else
+        av_free(hw_frame);
+#endif
+
+    return ret;
+}
+
+static void hw_decode_packet(AVCodecContext *decoder_ctx, AVFrame *sw_frame,
+                             int *got_picture, AVPacket *pkt)
+{
+    int ret = -1;
+
+    *got_picture = 0;
+
+    ret = avcodec_send_packet(decoder_ctx, pkt);
+    if (ret < 0) {
+        return ;
+    }
+
+    ret = hw_decode_receive_frame(decoder_ctx, sw_frame);
+    if ( ret == 0 )
+        *got_picture = 1;
+
+    return ;
+}
+
+bool CvCapture_FFMPEG::try_hw_codec(AVCodecContext *enc, AVStream *video_st)
+{
+   int ret;
+   AVCodec *codec;
+
+   // check environment variable
+   char* dfh_env = getenv("OPENCV_FFMPEG_CAPTURE_DISABLE_HW");
+   if(dfh_env && dfh_env[0] == '1')
+      return false;
+
+   // only support H264 hw codec for now
+   if (enc->codec_id != AV_CODEC_ID_H264)
+      return false;
+
+   // open the hardware device
+   hw_device_ref = NULL;
+   ret = av_hwdevice_ctx_create(&hw_device_ref, AV_HWDEVICE_TYPE_QSV, "auto", NULL, 0);
+   if (ret < 0) {
+      CV_WARN("Cannot open the qsv hardware device");
+      return false;
+   }
+
+   // initialize the decoder
+   codec = avcodec_find_decoder_by_name("h264_qsv");
+   if (!codec) {
+      CV_WARN("The QSV decoder is not present in libavcodec");
+      goto hw_invalid;
+   }
+
+   decoder_ctx = avcodec_alloc_context3(codec);
+   if (!decoder_ctx) {
+      CV_WARN("Not enough memory");
+      goto hw_invalid;
+   }
+
+   decoder_ctx->codec_id = AV_CODEC_ID_H264;
+   if (video_st->codecpar->extradata_size) {
+      decoder_ctx->extradata =  (uint8_t *)av_mallocz(video_st->codecpar->extradata_size +
+            AV_INPUT_BUFFER_PADDING_SIZE);
+      if (!decoder_ctx->extradata) {
+         CV_WARN("Not enough memory");
+         goto hw_invalid;
+      }
+      else
+      {
+         memcpy(decoder_ctx->extradata, video_st->codecpar->extradata,
+               video_st->codecpar->extradata_size);
+         decoder_ctx->extradata_size = video_st->codecpar->extradata_size;
+      }
+   }
+
+   decoder_ctx->opaque      = hw_device_ref;
+   decoder_ctx->get_format  = get_format;
+
+   if (avcodec_open2(decoder_ctx, codec, NULL) < 0)
+      goto hw_invalid;
+
+   return true;
+
+hw_invalid:
+   // release hw stuff
+   avcodec_free_context(&decoder_ctx);
+   av_buffer_unref(&hw_device_ref);
+
+   return false;
+}
+
 bool CvCapture_FFMPEG::open( const char* _filename )
 {
     InternalFFMpegRegister::init();
@@ -954,14 +1138,18 @@ bool CvCapture_FFMPEG::open( const char* _filename )
             int enc_width = enc->width;
             int enc_height = enc->height;
 
-            AVCodec *codec;
-            if(av_dict_get(dict, "video_codec", NULL, 0) == NULL) {
-                codec = avcodec_find_decoder(enc->codec_id);
-            } else {
-                codec = avcodec_find_decoder_by_name(av_dict_get(dict, "video_codec", NULL, 0)->value);
+            use_hw_codec = try_hw_codec(enc, ic->streams[i]);
+
+            if (!use_hw_codec) {
+               AVCodec *codec;
+               if(av_dict_get(dict, "video_codec", NULL, 0) == NULL) {
+                  codec = avcodec_find_decoder(enc->codec_id);
+               } else {
+                  codec = avcodec_find_decoder_by_name(av_dict_get(dict, "video_codec", NULL, 0)->value);
+               }
+               if (!codec || avcodec_open2(enc, codec, NULL) < 0)
+                  goto exit_func;
             }
-            if (!codec || avcodec_open2(enc, codec, NULL) < 0)
-                goto exit_func;
 
             // checking width/height (since decoder can sometimes alter it, eg. vp6f)
             if (enc_width && (enc->width != enc_width)) { enc->width = enc_width; }
@@ -1182,7 +1370,11 @@ bool CvCapture_FFMPEG::grabFrame()
         }
 
         // Decode video frame
-        avcodec_decode_video2(video_st->codec, picture, &got_picture, &packet);
+        if (use_hw_codec) {
+           hw_decode_packet(decoder_ctx, picture, &got_picture, &packet);
+        } else {
+           avcodec_decode_video2(video_st->codec, picture, &got_picture, &packet);
+        }
 
         // Did we get a video frame?
         if(got_picture)
@@ -1244,15 +1436,30 @@ bool CvCapture_FFMPEG::retrieveFrame(int, unsigned char** data, int* step, int* 
         // Also we use coded_width/height to workaround problem with legacy ffmpeg versions (like n0.8)
         int buffer_width = video_st->codec->coded_width, buffer_height = video_st->codec->coded_height;
 
-        img_convert_ctx = sws_getCachedContext(
+	if(use_hw_codec)
+        {
+            img_convert_ctx = sws_getCachedContext(
                 img_convert_ctx,
                 buffer_width, buffer_height,
-                video_st->codec->pix_fmt,
+                AV_PIX_FMT_NV12,
                 buffer_width, buffer_height,
                 AV_PIX_FMT_BGR24,
                 SWS_BICUBIC,
                 NULL, NULL, NULL
                 );
+        }
+	else
+	{
+           img_convert_ctx = sws_getCachedContext(
+                   img_convert_ctx,
+                   buffer_width, buffer_height,
+                   video_st->codec->pix_fmt,
+                   buffer_width, buffer_height,
+                   AV_PIX_FMT_BGR24,
+                   SWS_BICUBIC,
+                   NULL, NULL, NULL
+                   );
+	}
 
         if (img_convert_ctx == NULL)
             return false;//CV_Error(0, "Cannot initialize the conversion context!");
@@ -1471,7 +1678,10 @@ void CvCapture_FFMPEG::seek(int64_t _frame_number)
         double  time_base  = r2d(ic->streams[video_stream]->time_base);
         time_stamp += (int64_t)(sec / time_base + 0.5);
         if (get_total_frames() > 1) av_seek_frame(ic, video_stream, time_stamp, AVSEEK_FLAG_BACKWARD);
-        avcodec_flush_buffers(ic->streams[video_stream]->codec);
+        if (use_hw_codec)
+           avcodec_flush_buffers(decoder_ctx);
+        else
+           avcodec_flush_buffers(ic->streams[video_stream]->codec);
         if( _frame_number > 0 )
         {
             grabFrame();
